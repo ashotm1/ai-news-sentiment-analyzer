@@ -1,15 +1,24 @@
 import requests
 from bs4 import BeautifulSoup
 
+from openai_local.openai import analyze_titles
+
 FINBERT_URL = "http://127.0.0.1:5000/analyze"
 
 
-def analyze_sentiment(texts):
-    res = requests.post(FINBERT_URL, json={"text": texts})
-    return res.json()
+def analyze_sentiment(texts, model="finbert"):
+    if model == "finbert":
+        res = requests.post(FINBERT_URL, json={"text": texts, "model": model})
+        return res.json()
+    elif model == "gpt-5-mini":
+        
+        # Use the GPT-5 Mini model
+        return analyze_titles(texts)
+    else:
+        raise ValueError("Unsupported model")
 
 
-def scrape(limit=10):
+def scrape(limit=10, model="finbert"):
     url = "https://www.stocktitan.net/news/live.html"
     html = requests.get(url).text
     soup = BeautifulSoup(html, "html.parser")
@@ -48,7 +57,7 @@ def scrape(limit=10):
 
     # sentiment batch call
     titles = [a["title"] for a in articles]
-    sentiments = analyze_sentiment(titles)
+    sentiments = analyze_sentiment(titles, model)
 
     for i, a in enumerate(articles):
         s = sentiments[i]

@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from scraper.stocktitan import scrape  
+import time
 
 app = FastAPI()
 
@@ -15,9 +16,24 @@ def home():
 
 @app.post("/run")
 async def run(request: Request):
+    start_total = time.perf_counter()  # total time measurement
 
     body = await request.json()
     limit = body.get("limit", 10)
+    model = body.get("model", "gpt-5-mini")
 
-    articles = scrape(limit)  # call your existing Python function
-    return {"articles": articles}
+    # Measure model time inside scrape()
+    start_model = time.perf_counter()
+    articles = scrape(limit, model)  # scrape already calls analyze_sentiment
+    end_model = time.perf_counter()
+
+    end_total = time.perf_counter()
+
+    return {
+        "articles": articles,
+        "timing": {
+            "model_time": round(end_model - start_model, 7),
+            "total_time": round(end_total - start_total, 7)
+        },
+        "model": model
+    }
