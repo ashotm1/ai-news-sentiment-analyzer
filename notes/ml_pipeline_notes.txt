@@ -1,0 +1,145 @@
+================================================================================
+ML PIPELINE NOTES — PR-BASED TRADING SIGNAL
+================================================================================
+
+--- GOAL ---
+Train ML model on historical EDGAR PRs + price movement labels.
+Run live inference on StockTitan feed.
+Target: small cap speculative stocks (biotech, tech, crypto-adjacent, mining).
+
+--- ARCHITECTURE ---
+EDGAR (historical) → batch_filter.py detects PRs → LLM extracts features
+→ pair with price data → train ML model
+
+StockTitan (live) → scrape PRs → same feature extraction → model inference → signal
+
+--- WHY SENTIMENT ALONE IS NOT ENOUGH ---
+FinBERT/simple sentiment achieves only 45-53% accuracy on actual price movement.
+Barely better than a coin flip for small caps.
+Small cap PRs are narrative-driven — signal is in specificity, credibility, absence.
+LLM needed for reasoning about what's missing, not just tone.
+
+--- LLM FEATURE EXTRACTION ---
+Use LLM (Sonnet preferred over Haiku for this complexity) to extract structured JSON.
+Temperature = 0 mandatory for consistency across thousands of PRs.
+Few-shot with 2-3 real examples from actual small cap PRs (not synthetic).
+Always extract supporting quotes to validate against hallucination.
+
+Schema:
+{
+  "announcement_type": "partnership|funding|clinical|regulatory|technology|personnel",
+  "commitment_level": "aspirational|mou|loi|signed|completed",
+  "specificity_score": 0-10,
+  "hype_score": 0-10,
+  "overall_substance_score": 0-10,
+  "credibility": {
+    "named_partners": ["list or empty"],
+    "dollar_amount_disclosed": true/false,
+    "timeline_disclosed": true/false,
+    "third_party_validation": true/false
+  },
+  "missing_flags": {
+    "no_deal_value": true/false,
+    "no_timeline": true/false,
+    "no_partner_quote": true/false,
+    "no_regulatory_path": true/false
+  },
+  "supporting_quotes": ["key quotes that support extractions"]
+}
+
+ABSENCE IS AS IMPORTANT AS PRESENCE:
+- No deal value → early stage or unfavorable terms
+- No named partner → "leading technology company" = meaningless
+- No timeline → execution risk
+- No co-press release from partner → they may not be enthusiastic
+
+--- INPUT FEATURES (~35-40 total) ---
+
+PR-derived (~15 raw → ~20 after encoding):
+  - announcement_type       (categorical → ~8 one-hot)
+  - commitment_level        (categorical → ~5 one-hot)
+  - specificity_score       (0-10)
+  - hype_score              (0-10)
+  - overall_substance_score (0-10)
+  - named_partner           (binary)
+  - dollar_amount_disclosed (binary)
+  - timeline_disclosed      (binary)
+  - third_party_validation  (binary)
+  - no_deal_value           (binary)
+  - no_timeline             (binary)
+  - no_partner_quote        (binary)
+  - no_regulatory_path      (binary)
+
+Market/stock (~15):
+  - float
+  - short_interest
+  - relative_volume
+  - price
+  - sector                  (categorical → one-hot)
+  - StockTitan tags         (~5 binaries: penny, low_float, earnings, acquisition, etc.)
+
+Consider composite features encoding domain knowledge before training:
+  signal_strength = (specificity_score * commitment_weight) / (hype_score + 1)
+  market_sensitivity = (1 / float) * relative_volume
+
+--- OUTPUT LABELS ---
+Start with binary classification at meaningful threshold:
+  label_move = 1 if price_change_1h > 3% else 0
+
+Add sustainability label:
+  label_held = 1 if price_change_1d > price_change_1h * 0.5 else 0
+
+Train two separate XGBoost models (one per label). No data multiplication needed.
+The combo is the real edge: high substance score + move that holds = signal.
+
+Threshold guidance for small caps: >2-3% reasonable, >5% strong, >10% big movers only.
+Small caps can move 20-50% on news so threshold can be higher than large cap work.
+
+--- DATA REQUIREMENTS ---
+Rule of thumb: 10-100x feature count minimum samples.
+
+  Bare minimum:  400-500  (will overfit)
+  Decent:        2,000-5,000
+  Strong:        10,000+
+
+The real constraint is POSITIVE SAMPLES (class imbalance):
+  Assume ~25% of PRs hit >3% move threshold
+  Need 4,000 positive samples minimum (comfortable)
+  → Need ~15,000-20,000 total PRs collected
+
+Samples per feature math:
+  minimum  = features × 10  = 40 × 10  = 400  positive samples
+  comfortable = features × 50  = 40 × 50  = 2,000
+  strong   = features × 100 = 40 × 100 = 4,000
+
+--- STRATEGY FOR DATA VOLUME ---
+- Don't narrow to only biotech/small cap early — use sector as feature, not filter
+- Train on all PR types first, more data beats more purity at this stage
+- 3 years of EDGAR data (2022-2025) covers bull + bear + volatile regimes
+- Multiple time horizons (T+1h, T+4h, T+1d) as separate labels = 3x signal from same PRs
+- Oversample rare categories (FDA approvals etc.) with SMOTE if needed
+
+--- MODEL ---
+XGBoost handles mixed feature vectors (numeric + binary + categorical) very well.
+No deep learning needed at this stage.
+Let feature importance after first training tell you what actually matters.
+Don't over-engineer feature priority before training — validate intuitions against data.
+
+--- PRICE DATA ---
+Source: Massive API (5 calls/min, deep 1-min history)
+Need: exact EDGAR filing timestamp + price at T-5min, T+5min, T+30min, T+1h, T+1d
+Watch for: pre-market filings (many earnings drop 7-8am ET, move shows at 9:30 open)
+~2,000 unique ticker+date combos for 10,000 filings → ~400 min at 5/min (~7 hours)
+Run overnight alongside EDGAR pipeline.
+
+--- PR TYPES ---
+Earnings PRs (8-K Item 2.02): high volume, structured, most market-moving
+Non-earnings PRs (Items 7.01, 8.01): speculative, narrative-driven, your main target
+Label both but may want separate models eventually.
+
+--- PUMP VS REAL MOVE SIGNALS ---
+Pump flags:        high hype + low specificity + missing deal value + aspirational language
+Real move signals: named partners + signed commitment + dollar amount + timeline + validation
+Sustainability:    real moves hold, pumps reverse within hours (use label_held)
+
+================================================================================
