@@ -2,26 +2,21 @@
 
 Event-driven trading signal pipeline for small-cap stocks. Detects and classifies SEC 8-K press releases, extracts structured features via LLM, and pairs them with intraday price reactions for ML training.
 
-Scope is non-earnings catalyst events — M&A, clinical readouts, crypto treasury, collaborations, contract wins, product launches, etc.
+Scope is non-earnings catalyst events — M&A, clinical readouts, crypto treasury, collaborations, contracts, product launches, etc.
+
+> **Status:** Data pipeline and LLM feature extraction are in progress. ML model training and signal prediction are not yet implemented.
 
 ---
 
-## Pipeline
+## Data Pipeline
+
+Downloads EDGAR 8-K filings, identifies press releases, classifies them by catalyst type, extracts structured LLM features, and fetches corresponding intraday price data from Polygon.
+
+Classification works in two passes — a fast regex pass on the PR title, followed by an optional LLM batch pass for anything the regex didn't catch. Signal catalysts: `clinical`, `private_placement`, `collaboration`, `m&a`, `new_product`, `contract`, `crypto_treasury`.
 
 ```bash
 python pipeline.py --days 30 --llm --prices
 ```
-
-**Steps:**
-1. `download_idx.py` — download EDGAR daily index files
-2. `parse_idx.py` — extract 8-K rows → `data/8k.csv`
-3. `batch_filter.py` — collect EX-99 exhibit URLs → `data/8k_ex99.csv`
-4. `regex_classifier.py` — classify exhibits as PRs, tag catalyst → `data/ex_99_classified.csv`
-5. `llm_classifier.py` — Haiku batch API refines unclassified rows (optional `--llm`)
-6. `extract_features.py` — LLM feature extraction on signal PRs → `data/pr_features.csv`
-7. `fetch_prices.py` — Polygon price data for signal tickers → `data/price_bars.csv` etc.
-
-**Signal catalysts:** `clinical`, `private_placement`, `collaboration`, `m&a`, `new_product`, `contract`, `crypto_treasury`
 
 ---
 
