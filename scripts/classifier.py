@@ -69,13 +69,13 @@ _PRIVATE_PLACEMENT = re.compile(r"private placement", re.IGNORECASE)
 _SPLIT             = re.compile(r"stock split", re.IGNORECASE)
 _DIVIDEND          = re.compile(r"dividends?", re.IGNORECASE)
 _NASDAQ_ALERT      = re.compile(r"minimum bid price|nasdaq notification", re.IGNORECASE)
-_NEW_PRODUCT       = re.compile(r"unveils|\blaunches\b|\bintroduces\b", re.IGNORECASE)
-_OFFERING          = re.compile(r"registered direct offering|announces pricing|\boffering\b", re.IGNORECASE)
+_NEW_PRODUCT       = re.compile(r"unveils|\bintroduces\b", re.IGNORECASE)
+_OFFERING          = re.compile(r"registered direct offering|announces pricing", re.IGNORECASE)
 _MA                = re.compile(
-    r"\bmerger\b|\bacquires\b|to acquire|to merge|\btender offer\b|\bacquisition\b|\bdivest"
+    r"\bmerger\b|\bacquires\b|to acquire|to merge|\btender offer\b|\bacquisition\b"
     r"|\bcommitted to.{0,20}transaction\b|\bclosing expected\b"
     r"|to be acquired|definitive agreement.{0,30}(?:acqui|merg|sale)"
-    r"|sale to.{0,20}(?:private equity|PE firm|\bfirm\b)"
+    r"|sale to.{0,20}(?:private equity|PE firm)"
     r"|take.{0,10}private",
     re.IGNORECASE,
 )
@@ -93,17 +93,25 @@ _PERSONNEL         = re.compile(
     r"|\bnamed\b.{0,30}(?:CEO|CFO|COO|CTO|president|chairman|director)",
     re.IGNORECASE,
 )
-_AGREEMENT         = re.compile(r"\bagreement\b|\bdeal\b", re.IGNORECASE)
-_COLLABORATION     = re.compile(r"strategic collaboration|collaboration agreement|\blicensing\s+agreement\b|strategic partnership|strategic alliance|co-development agreement", re.IGNORECASE)
+_AGREEMENT         = re.compile(r"\bagreement\b", re.IGNORECASE)
+_COLLABORATION     = re.compile(r"strategic collaboration|collaboration agreement|\blicensing\s+agreement\b|\blicense deal\b|strategic partnership|strategic alliance|co-development agreement", re.IGNORECASE)
 _DEBT_OFFERING     = re.compile(r"senior notes|senior unsecured|debt restructuring|notes offering|credit facility|\bnotes due\b|credit facilities|exchangeable.*debentures|secured.*credit|\b\d+\.?\d*%\s+(?:senior|notes|debentures)", re.IGNORECASE)
 _REBRANDING        = re.compile(r"name change|\brebrands?\b|announces new name|formerly known as", re.IGNORECASE)
 _BUYBACK           = re.compile(r"share repurchase|stock repurchase|\bbuyback\b|repurchase program", re.IGNORECASE)
-_ASSET_TRANSACTION = re.compile(r"asset sale|sale of.{0,30}(?:operations|division|unit|subsidiary|\bassets?\b)|\bdivests?\b|disposition of", re.IGNORECASE)
+_ASSET_TRANSACTION = re.compile(r"asset sale|sale of.{0,30}(?:operations|division|unit|subsidiary|\bassets?\b)|\bdivests?\b|disposition of|agreement to sell.{0,40}(?:propert|subsidiar|stake|\bassets?\b)", re.IGNORECASE)
+_LEGAL             = re.compile(r"settlement agreement|resolv.{0,20}(?:litigation|lawsuit|patent dispute)|patent settlement|\blitigation settlement\b", re.IGNORECASE)
 _SPAC              = re.compile(r"business combination|over-allotment|separate trading.{0,20}(?:shares|warrants)|de-spac", re.IGNORECASE)
 _REGULATORY        = re.compile(r"commission (?:approves?|authorizes?)|authorizes? new rates|regulatory approval(?! of drug| of therapy| of treatment)|restores? compliance|nasdaq.*(?:compliance|rule)", re.IGNORECASE)
-_OPERATIONAL_UPDATE= re.compile(r"assets under management|\bAUM\b|monthly production|operational update|business update|\boutlook\b(?!.{0,20}(?:drug|trial|therapy))|annual report|shareholder letter|corporate update", re.IGNORECASE)
-_INVESTOR_EVENT    = re.compile(r"to participate|to present at|to host|investor day|analyst day|to speak at|conference call scheduled|to ring the bell|schedules.*(?:earnings call|earnings release)", re.IGNORECASE)
+_OPERATIONAL_UPDATE= re.compile(r"assets under management|\bAUM\b|monthly production|operational update|business update|annual report|shareholder letter|corporate update|termination of.{0,20}lease|\blease.{0,20}termination\b", re.IGNORECASE)
+_RIGHTS_PLAN       = re.compile(r"rights agreement|shareholder rights plan|rights plan|\bpoison pill\b", re.IGNORECASE)
+_INVESTOR_EVENT    = re.compile(r"investor day|analyst day|to speak at|conference call scheduled|to ring the bell|schedules.*(?:earnings call|earnings release)|to participate in.{0,40}(?:conference|summit|forum|symposium)|to present at.{0,40}(?:conference|summit|forum|symposium)|to host.{0,40}(?:conference|investor|analyst)", re.IGNORECASE)
 _CONTRACT          = re.compile(r"\bawarded?\b.{0,30}(?:contract|order|grant|funding)|\bwins?\b.{0,30}contract|\bsecures?\b.{0,30}(?:contract|order)|\breceives?\b.{0,30}order\b", re.IGNORECASE)
+_CRYPTO_TREASURY   = re.compile(
+    r"bitcoin.{0,30}(?:treasury|reserve|strateg|purchase|acquisition|holding)"
+    r"|(?:digital asset|ethereum|crypto).{0,30}(?:treasury|reserve|strateg)"
+    r"|\bETH holdings\b|\bBTC holdings\b",
+    re.IGNORECASE,
+)
 _FINANCIAL_UPDATE  = re.compile(r"record.{0,30}(?:commitments?|investments?)|distribution rate|net asset value|\bNAV\b", re.IGNORECASE)
 _CLINICAL          = re.compile(
     r"to presents?.{0,40}data|data.{0,40}to present"
@@ -143,17 +151,20 @@ def classify_catalyst(title):
         (_PRIVATE_PLACEMENT,  "private_placement"),
         (_COLLABORATION,      "collaboration"),
         (_MA,                 "m&a"),
-        (_ASSET_TRANSACTION,  "asset_transaction"),
         (_NEW_PRODUCT,        "new_product"),
         (_CONTRACT,           "contract"),
-        (_AGREEMENT,          "agreement"),
+        (_CRYPTO_TREASURY,    "crypto_treasury"),
         # ── EXCLUSION tags ────────────────────────────────────────────────────
+        (_ASSET_TRANSACTION,  "asset_transaction"),
+        (_AGREEMENT,          "agreement"),
         (_OFFERING,           "offering"),
         (_DEBT_OFFERING,      "debt_offering"),
         (_PERSONNEL,          "personnel"),
         (_BUYBACK,            "buyback"),
         (_SPLIT,              "split"),
         (_DIVIDEND,           "dividend"),
+        (_LEGAL,              "legal"),
+        (_RIGHTS_PLAN,        "rights_plan"),
         (_NASDAQ_ALERT,       "nasdaq_alert"),
         (_SPAC,               "spac"),
         (_REBRANDING,         "rebranding"),

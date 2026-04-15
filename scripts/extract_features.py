@@ -5,22 +5,21 @@ For each confirmed PR (is_pr=True in data/ex_99_classified.csv), fetches the fir
 words of the EX-99 exhibit and extracts structured features via Claude Haiku.
 
 Output fields:
-  catalyst_type     : offering | acquisition | clinical | partnership |
-                      contract | product_launch | financial | guidance |
-                      buyback | dividend | other
-  dollar_amount     : largest deal/transaction figure in millions (float or null)
-  has_named_partner : bool — specific external company/institution named
-  commitment_level  : 1-10 — speculative language (1) vs binding/done-deal (10)
-  significance_score: 1-10 — actual news weight, substance over language
-  is_dilutive       : bool — explicit offering/placement/warrant language present
-  earnings_guidance : pos | neg | reaffirmed | null
-  milestone_guidance: bool — forward milestone projected (FDA filing, close by Q3, etc.)
-  has_revenue       : bool
-  revenue_figure    : float (millions) or null
-  has_growth_pct    : bool
-  growth_pct        : float or null
-  sentiment         : positive | negative | neutral
-  llm_notes         : list of strings — anything notable not captured above
+  dollar_amount      : largest deal/transaction figure in millions (float or null)
+  dollar_amount_type : "acquisition" | "raise" | "partnership" | "contract" | "grant" | null
+  has_named_partner  : 1/0/null — specific external company or institution named
+  commitment_level   : 1-10 — speculative (1) to binding/already closed (10)
+  significance_score : 1-10 — actual news weight based on substance not language
+  is_dilutive        : 1/0/null — offering/placement/warrant language explicitly present
+  milestone_guidance : 1/0/null — forward milestone projected (FDA filing, close by Q3, etc.)
+  sentiment          : positive | negative | neutral
+  specificity_score  : 1-10 — vague language (1) to precise facts/numbers (10)
+  hype_score         : 1-10 — neutral tone (1) to promotional/buzzword-heavy (10)
+  has_quantified_impact : 1/0/null — specific numeric impact stated (revenue, patients, units)
+  is_restatement     : 1/0/null — correction or restatement of a prior filing
+  green_flags        : list of phrases (max 5) — binding language, named parties, specific numbers/timelines
+  red_flags          : list of phrases (max 5) — vague quantities, stacked hedges, missing counterparty
+  extra              : object or null — novel key-value observations not captured by fields above
 
 Output: data/pr_features.csv
 Append-safe: skips ex99_urls already in output.
@@ -51,43 +50,39 @@ BATCH_SIZE = 10
 BATCH_INTERVAL = 1.0
 LLM_INTERVAL = 1.2
 WORDS_TO_CONSUME = 500
+MAX_TOKENS = 1024
 MODEL = "claude-haiku-4-5-20251001"
-
-CATALYST_TYPES = [
-    "offering", "acquisition", "clinical", "partnership", "contract",
-    "product_launch", "financial", "guidance", "buyback", "dividend", "legal",
-    "other",
-]
 
 _anthropic_async = AsyncAnthropic()
 _anthropic_sync  = Anthropic()
 
-_SYSTEM_PROMPT = f"""You are a financial analyst extracting structured data from press release excerpts.
-Return ONLY a valid JSON object with exactly these fields — no explanation, no markdown:
+_SYSTEM_PROMPT = """You are a financial analyst extracting structured data from press release excerpts.
+Return ONLY a valid JSON object with exactly these fields:
 
-{{
-  "catalyst_type": one of {json.dumps(CATALYST_TYPES)},
+{
   "dollar_amount": largest deal/transaction figure in millions as float, or null,
-  "has_named_partner": true/false — is a specific external company or institution named,
+  "dollar_amount_type": what the figure represents — "acquisition", "raise", "partnership", "contract", "grant", or null,
+  "has_named_partner": true if a specific external company or institution is named, false if confirmed absent, null if not applicable,
   "commitment_level": integer 1-10 — 1=speculative/exploratory, 10=binding/already closed,
   "significance_score": integer 1-10 — actual news weight based on substance not language,
-  "is_dilutive": true/false — only if PR explicitly mentions offering, placement, or warrant issuance,
-  "earnings_guidance": "pos", "neg", "reaffirmed", or null — only for financial outlook statements,
-  "milestone_guidance": true/false — forward milestone projected (e.g. expects FDA filing by Q2),
-  "has_revenue": true/false,
-  "revenue_figure": revenue figure in millions as float, or null,
-  "has_growth_pct": true/false,
-  "growth_pct": explicit growth percentage as float, or null,
+  "is_dilutive": true if PR explicitly mentions offering, placement, or warrant issuance, false if confirmed absent, null if not applicable,
+  "milestone_guidance": true if a forward milestone is projected (e.g. expects FDA filing by Q2), false if confirmed absent, null if not applicable,
   "sentiment": "positive", "negative", or "neutral",
-  "llm_notes": list of strings — any notable observations not captured above, empty list if none
-}}"""
+  "specificity_score": integer 1-10 — 1=vague/no facts, 10=precise numbers/dates/names throughout,
+  "hype_score": integer 1-10 — 1=neutral factual tone, 10=promotional/buzzword-heavy language,
+  "has_quantified_impact": true if a specific numeric impact is stated (revenue, patients, units, savings), false if confirmed absent, null if not applicable,
+  "is_restatement": true if this corrects or restates a prior filing, false if confirmed absent, null if cannot determine,
+  "green_flags": list of short phrases (max 5) — binding language, named counterparties, specific numbers or timelines. Only include observations NOT captured by the fields above. Empty list if none,
+  "red_flags": list of short phrases (max 5) — vague quantities, stacked conditionals, missing counterparty, no timeline. Only include observations NOT captured by the fields above. Empty list if none,
+  "extra": object with novel key-value observations not captured by the fields above, or null if nothing to add. Only use for genuinely new signal — not a summary.
+}"""
 
 _FEATURE_KEYS = [
-    "catalyst_type", "dollar_amount", "has_named_partner",
+    "dollar_amount", "dollar_amount_type", "has_named_partner",
     "commitment_level", "significance_score", "is_dilutive",
-    "earnings_guidance", "milestone_guidance",
-    "has_revenue", "revenue_figure", "has_growth_pct", "growth_pct",
-    "sentiment", "llm_notes",
+    "milestone_guidance", "sentiment", "specificity_score", "hype_score",
+    "has_quantified_impact", "is_restatement",
+    "green_flags", "red_flags", "extra",
 ]
 
 _NULL_FEATURES = {k: None for k in _FEATURE_KEYS}
@@ -109,17 +104,21 @@ def _extract_text(html: str, max_words: int = WORDS_TO_CONSUME) -> str:
 
 
 def _parse_llm_response(raw: str) -> dict:
-    """Parse JSON from LLM response, serializing llm_notes for CSV storage."""
+    """Parse JSON from LLM response, serializing list/dict fields for CSV storage."""
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
     data = json.loads(raw)
-    if "llm_notes" in data and isinstance(data["llm_notes"], list):
-        data["llm_notes"] = json.dumps(data["llm_notes"])
+    for key in ("green_flags", "red_flags"):
+        if isinstance(data.get(key), list):
+            data[key] = json.dumps(data[key])
+    if isinstance(data.get("extra"), dict):
+        data["extra"] = json.dumps(data["extra"]) if data["extra"] else None
     return {k: data.get(k) for k in _FEATURE_KEYS}
 
 
 def _load_pending(done_urls: set) -> pd.DataFrame:
     df = pd.read_csv(INPUT_CSV)
     df = df[df["is_pr"] == True].reset_index(drop=True)
+    df["title"] = df["title"].replace("", None)
     print(f"Loaded {len(df)} confirmed PRs from {INPUT_CSV}")
     df = df[~df["ex99_url"].isin(done_urls)].reset_index(drop=True)
     print(f"  {len(df)} pending after skipping {len(done_urls)} already processed")
@@ -139,7 +138,7 @@ async def _call_llm(excerpt: str) -> dict:
     try:
         msg = await _anthropic_async.messages.create(
             model=MODEL,
-            max_tokens=512,
+            max_tokens=MAX_TOKENS,
             temperature=0,
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": excerpt}],
@@ -254,13 +253,7 @@ def _submit_batch(df: pd.DataFrame, excerpts: dict) -> str:
                 "model": MODEL,
                 "max_tokens": 512,
                 "temperature": 0,
-                "system": [
-                    {
-                        "type": "text",
-                        "text": _SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
+                "system": _SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": excerpt}],
             },
         })
@@ -398,7 +391,19 @@ def main():
                         help="Check batch status and collect results when ready")
     parser.add_argument("--status", action="store_true",
                         help="Show live progress of the current batch")
+    parser.add_argument("--input",  default=None, help="Override input CSV path")
+    parser.add_argument("--output", default=None, help="Override output CSV path")
+    parser.add_argument("--model",  default=None, help="Override model ID")
     args = parser.parse_args()
+
+    global INPUT_CSV, OUTPUT_CSV, BATCH_STATE_FILE, MODEL
+    if args.input:
+        INPUT_CSV = args.input
+    if args.output:
+        OUTPUT_CSV = args.output
+        BATCH_STATE_FILE = OUTPUT_CSV.replace(".csv", "_batch.json")
+    if args.model:
+        MODEL = args.model
 
     if args.submit_batch:
         asyncio.run(run_submit_batch())

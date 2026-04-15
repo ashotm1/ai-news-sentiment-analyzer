@@ -44,7 +44,7 @@ OUTPUT_DETAILS_CSV = "data/ticker_details.csv"    # ticker details as of filing 
 # Signal-group catalysts to fetch prices for (see classifier.py classify_catalyst)
 _TARGET_CATALYSTS = {
     "clinical", "private_placement", "collaboration",
-    "m&a", "asset_transaction", "new_product", "contract", "agreement",
+    "m&a", "new_product", "contract", "crypto_treasury",
 }
 
 
@@ -106,10 +106,11 @@ async def fetch_daily_bars(client: httpx.AsyncClient, ticker: str, date_str: str
 
 
 async def fetch_ticker_details(client: httpx.AsyncClient, ticker: str, date_str: str) -> dict:
-    """Fetch ticker reference data (market cap, shares, exchange) as of date_str."""
+    """Fetch ticker reference data (market cap, shares, exchange) as of prior trading day."""
+    prior = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     url = (
         f"{POLYGON_BASE}/v3/reference/tickers/{ticker}"
-        f"?date={date_str}&apiKey={MASSIVE_API_KEY}"
+        f"?date={prior}&apiKey={MASSIVE_API_KEY}"
     )
     try:
         r = await client.get(url, timeout=30)
@@ -307,36 +308,49 @@ async def run():
                 if cache_key not in bars_cache and cache_key not in fetched_td:
                     print(f"\n  {ticker}  {date_str}", flush=True)
 
-                    # Call 1 — 1-min intraday bars
-                    bars = await _poly_get(
-                        fetch_1min_bars(poly_client, ticker, date_str),
-                        f"{ticker} 1min",
-                    )
-                    bars_cache[cache_key] = bars
-                    for bar in bars:
-                        intraday_rows.append({"ticker": ticker, "date_str": date_str, **bar})
-
-                    # Call 2 — daily bars (pre-PR window)
-                    daily = await _poly_get(
-                        fetch_daily_bars(poly_client, ticker, date_str),
-                        f"{ticker} daily",
-                    )
-                    daily_cache[cache_key] = daily
-                    for bar in daily:
-                        daily_rows.append({"ticker": ticker, "date_str": date_str, **bar})
-
-                    # Call 3 — ticker details as of filing date
+                    # Call 1 — ticker details (most failable: delisted, unknown ticker, bad date)
                     details = await _poly_get(
                         fetch_ticker_details(poly_client, ticker, date_str),
                         f"{ticker} details",
                     )
-                    details_cache[cache_key] = details
-                    if details:
-                        details_rows.append(_flatten_details(ticker, date_str, details))
-
                     if not details:
-                        print(f"  Skipping write — no details returned for {ticker} {date_str}", flush=True)
+                        print(f"  No details — skipping bars for {ticker} {date_str}", flush=True)
+                        bars_cache[cache_key] = []
                         continue
+
+                    market_cap = details.get("market_cap")
+                    if market_cap and market_cap > 500_000_000:
+                        print(f"  Skipping {ticker} — market cap ${market_cap/1e6:.0f}M > $500M", flush=True)
+                        bars_cache[cache_key] = []
+                        continue
+
+                    # Call 2 — 1-min intraday bars (fails on weekends, halted stocks)
+                    bars = await _poly_get(
+                        fetch_1min_bars(poly_client, ticker, date_str),
+                        f"{ticker} 1min",
+                    )
+                    if not bars:
+                        print(f"  No 1min bars — skipping daily for {ticker} {date_str}", flush=True)
+                        bars_cache[cache_key] = []
+                        continue
+
+                    # Call 3 — daily bars (least failable)
+                    daily = await _poly_get(
+                        fetch_daily_bars(poly_client, ticker, date_str),
+                        f"{ticker} daily",
+                    )
+
+                    # All 3 succeeded — commit to buffers
+                    bars_cache[cache_key] = bars
+                    daily_cache[cache_key] = daily
+                    details_cache[cache_key] = details
+
+                    for bar in bars:
+                        intraday_rows.append({"ticker": ticker, "date_str": date_str, **bar})
+                    for bar in daily:
+                        daily_rows.append({"ticker": ticker, "date_str": date_str, **bar})
+                    details_rows.append(_flatten_details(ticker, date_str, details))
+
                     _flush()
                 else:
                     # cache_key already fetched this run (bars_cache hit) or
