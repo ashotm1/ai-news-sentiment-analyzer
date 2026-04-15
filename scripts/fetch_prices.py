@@ -17,7 +17,7 @@ Requirements:
 
 Rate limits:
   Massive free tier: 5 calls/min  →  MASSIVE_INTERVAL = 12.1s between calls
-  Paid tier: 100 calls/min → set MASSIVE_INTERVAL = 0.62
+  Paid tier: unlimited → set MASSIVE_INTERVAL = 0
 """
 import ast
 import asyncio
@@ -316,12 +316,14 @@ async def run():
                     if not details:
                         print(f"  No details — skipping bars for {ticker} {date_str}", flush=True)
                         bars_cache[cache_key] = []
+                        rows_out.append(_price_row(row, ticker, date_str, {}))
                         continue
 
                     market_cap = details.get("market_cap")
                     if market_cap and market_cap > 500_000_000:
                         print(f"  Skipping {ticker} — market cap ${market_cap/1e6:.0f}M > $500M", flush=True)
                         bars_cache[cache_key] = []
+                        rows_out.append(_price_row(row, ticker, date_str, {}))
                         continue
 
                     # Call 2 — 1-min intraday bars (fails on weekends, halted stocks)
@@ -332,6 +334,7 @@ async def run():
                     if not bars:
                         print(f"  No 1min bars — skipping daily for {ticker} {date_str}", flush=True)
                         bars_cache[cache_key] = []
+                        rows_out.append(_price_row(row, ticker, date_str, {}))
                         continue
 
                     # Call 3 — daily bars (least failable)
@@ -340,7 +343,10 @@ async def run():
                         f"{ticker} daily",
                     )
 
-                    # All 3 succeeded — commit to buffers
+                    if not daily:
+                        print(f"  No daily bars for {ticker} {date_str}", flush=True)
+
+                    # Commit to buffers
                     bars_cache[cache_key] = bars
                     daily_cache[cache_key] = daily
                     details_cache[cache_key] = details

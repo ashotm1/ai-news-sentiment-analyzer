@@ -4,13 +4,14 @@ regex_classifier.py — Classify EX-99 exhibits as press releases using heuristi
 Reads data/8k_ex99.csv, fetches each EX-99, classifies using heuristics,
 extracts title, and applies regex catalyst tagging.
 Saves results to data/ex_99_classified.csv with is_pr and catalyst columns.
-Skips earnings filings (8-K item 2.02).
+Skips earnings-only filings (8-K item 2.02 with no signal items present).
 
 Rate: BATCH_SIZE=10 per BATCH_INTERVAL=1.0s → exactly 10 req/s.
 Append-safe: skips ex99_urls already present in the output CSV.
 """
 import asyncio
 import os
+import re
 import time
 
 import httpx
@@ -82,8 +83,11 @@ def main():
     df = pd.read_csv(INPUT_CSV)
     df = df[df["ex99_url"].notna() & (df["ex99_url"] != "")].reset_index(drop=True)
     before = len(df)
-    df = df[~df["items"].fillna("").str.contains(r"\b2\.02\b", regex=True)].reset_index(drop=True)
-    print(f"Loaded {len(df)} EX-99 exhibits ({before - len(df)} earnings filings excluded)", flush=True)
+    _SIGNAL_ITEMS = re.compile(r"\b(7\.01|8\.01|1\.01|2\.01|3\.02|5\.01)\b")
+    _has_202  = df["items"].fillna("").str.contains(r"\b2\.02\b", regex=True)
+    _has_signal = df["items"].fillna("").str.contains(_SIGNAL_ITEMS, regex=True)
+    df = df[~(_has_202 & ~_has_signal)].reset_index(drop=True)
+    print(f"Loaded {len(df)} EX-99 exhibits ({before - len(df)} earnings-only filings excluded)", flush=True)
 
     if os.path.exists(OUTPUT_CSV):
         existing = pd.read_csv(OUTPUT_CSV, usecols=["ex99_url"])

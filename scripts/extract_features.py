@@ -51,7 +51,7 @@ BATCH_INTERVAL = 1.0
 LLM_INTERVAL = 1.2
 WORDS_TO_CONSUME = 500
 MAX_TOKENS = 1024
-MODEL = "claude-haiku-4-5-20251001"
+MODEL = "claude-sonnet-4-6"
 
 _anthropic_async = AsyncAnthropic()
 _anthropic_sync  = Anthropic()
