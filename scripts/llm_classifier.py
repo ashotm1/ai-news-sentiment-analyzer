@@ -32,18 +32,20 @@ BATCH_INTERVAL   = 1.0
 LLM_INTERVAL     = 1.2
 SNIPPET_WORDS    = 150
 MAX_TOKENS       = 20
-MODEL            = "claude-haiku-4-5-20251001"
+MODEL            = "claude-sonnet-4-6"
 
 _VALID_TAGS = {
-    "clinical", "private_placement", "collaboration", "m&a",
-    "new_product", "contract", "crypto_treasury", "earnings", "other",
+    "biotech", "private_placement", "collaboration", "m&a",
+    "new_product", "contract", "crypto_treasury", "earnings",
+    "other", "unclear", "issue",
 }
 
 _SYSTEM = """You are a financial press release classifier.
 
-Given the opening text of a press release, output exactly one PRIMARY category:
+Given the opening text of a press release, output exactly one of these categories.
+If you are less than 90% confident, output 'unclear'.
 
-clinical — drug trials, FDA approvals, clinical data, biotech milestones
+biotech — drug trials, FDA approvals, clinical data, biotech milestones
 private_placement — private placement of shares or warrants
 collaboration — strategic partnerships, licensing deals, co-development agreements
 m&a — mergers, acquisitions, divestitures, tender offers
@@ -51,7 +53,9 @@ new_product — product launches, new technology introductions
 contract — contract wins, orders received, grants awarded
 crypto_treasury — bitcoin/crypto treasury adoption, BTC/ETH holdings announcements
 earnings — financial results, quarterly/annual earnings, revenue reports
-other
+other — primary category is clear but does not match any of the listed categories above
+unclear — could match one of the above but not enough information to determine which
+issue — title is boilerplate, truncated mid sentence, or not a real headline
 
 If multiple categories could apply, choose the most specific one.
 Reply with the category name only. No punctuation, no explanation."""
@@ -73,9 +77,16 @@ def _extract_snippet(html: str, max_words: int = SNIPPET_WORDS) -> str:
     return " ".join(words[:max_words])
 
 
-def _parse_tag(raw: str) -> str:
+MALFORMED_CSV = "data/llm_malformed.csv"
+
+def _parse_tag(raw: str, url: str = "") -> str:
     tag = raw.strip().lower().rstrip(".")
-    return tag if tag in _VALID_TAGS else "other"
+    if tag not in _VALID_TAGS:
+        row = pd.DataFrame([{"raw_output": raw, "ex99_url": url}])
+        write_header = not os.path.exists(MALFORMED_CSV)
+        row.to_csv(MALFORMED_CSV, mode="a", header=write_header, index=False)
+        return "other"
+    return tag
 
 
 def _load_pending(sample: int = 0) -> pd.DataFrame:
@@ -250,7 +261,7 @@ def run_collect_batch():
     for result in _anthropic_sync.messages.batches.results(state["batch_id"]):
         url = id_to_url.get(result.custom_id, result.custom_id)
         if result.result.type == "succeeded":
-            tag = _parse_tag(result.result.message.content[0].text)
+            tag = _parse_tag(result.result.message.content[0].text, url)
             updates[url] = tag
             print(f"  {tag:20s} | {url[:60]}", flush=True)
             succeeded += 1

@@ -19,6 +19,7 @@ Rate limits:
   Massive free tier: 5 calls/min  →  MASSIVE_INTERVAL = 12.1s between calls
   Paid tier: unlimited → set MASSIVE_INTERVAL = 0
 """
+import argparse
 import ast
 import asyncio
 import os
@@ -43,15 +44,10 @@ OUTPUT_DETAILS_CSV = "data/ticker_details.csv"    # ticker details as of filing 
 
 # Signal-group catalysts to fetch prices for (see classifier.py classify_catalyst)
 _TARGET_CATALYSTS = {
-    "clinical", "private_placement", "collaboration",
+    "biotech", "private_placement", "collaboration",
     "m&a", "new_product", "contract", "crypto_treasury",
 }
 
-
-def _is_target(val):
-    try: tags = ast.literal_eval(val)
-    except Exception: tags = [val]
-    return bool(set(tags) & _TARGET_CATALYSTS)
 
 
 # T+N offsets in milliseconds
@@ -196,7 +192,7 @@ def _flatten_details(ticker: str, date_str: str, d: dict) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def run():
+async def run(biotech_only: bool = False):
     if not MASSIVE_API_KEY:
         raise RuntimeError(
             "Missing API key. Set MASSIVE_API_KEY or POLYGON_API_KEY environment variable."
@@ -205,8 +201,11 @@ async def run():
     pr_df = pd.read_csv(INPUT_CSV)
     pr_df = pr_df[pr_df["is_pr"] == True].reset_index(drop=True)
 
-    pr_df = pr_df[pr_df["catalyst"].apply(_is_target)].reset_index(drop=True)
-    print(f"Loaded {len(pr_df)} PR rows from {INPUT_CSV} (catalyst filter: {_TARGET_CATALYSTS})")
+    catalyst_filter = {"biotech"} if biotech_only else _TARGET_CATALYSTS
+    pr_df = pr_df[pr_df["catalyst"].apply(lambda v: bool(set(ast.literal_eval(v) if isinstance(v, str) else [v]) & catalyst_filter))].reset_index(drop=True)
+    if biotech_only:
+        pr_df = pr_df[pr_df["catalyst_source"].isna()].reset_index(drop=True)
+    print(f"Loaded {len(pr_df)} PR rows from {INPUT_CSV} (catalyst filter: {catalyst_filter})")
 
     # ── Step 1: SEC submissions — CIK → ticker (cached) ──────────────────────
     unique_ciks = pr_df["cik"].unique()
@@ -377,7 +376,10 @@ async def run():
 
 
 def main():
-    asyncio.run(run())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--biotech", action="store_true", help="Only fetch prices for biotech catalyst rows")
+    args = parser.parse_args()
+    asyncio.run(run(biotech_only=args.biotech))
 
 
 if __name__ == "__main__":

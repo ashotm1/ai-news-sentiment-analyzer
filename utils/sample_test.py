@@ -23,7 +23,7 @@ SAMPLE_CSV   = "data/sample_200.csv"
 PER_BUCKET   = 30
 TOTAL        = 240
 SIGNAL_CATALYSTS = {
-    "clinical", "private_placement", "collaboration", "m&a",
+    "biotech", "private_placement", "collaboration", "m&a",
     "new_product", "contract", "crypto_treasury",
 }
 

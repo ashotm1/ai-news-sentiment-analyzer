@@ -8,7 +8,7 @@ not_pr = total - is_pr
 has_title = df[df['is_pr']==True]['title'].notna().sum()
 no_title = is_pr - has_title
 
-TARGET = {"m&a", "clinical", "private_placement", "new_product"}
+TARGET = {"m&a", "biotech", "private_placement", "new_product"}
 
 def parse_cats(val):
     try: return ast.literal_eval(val)

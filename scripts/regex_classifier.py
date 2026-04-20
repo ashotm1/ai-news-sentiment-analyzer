@@ -72,6 +72,7 @@ async def _run(df, fetched_urls):
 
             pd.DataFrame(results).to_csv(OUTPUT_CSV, mode="a", header=write_header, index=False)
             write_header = False
+            fetched_urls.update(r["ex99_url"] for r in results)
 
             elapsed = time.monotonic() - t_start
             remaining = BATCH_INTERVAL - elapsed
@@ -83,9 +84,8 @@ def main():
     df = pd.read_csv(INPUT_CSV)
     df = df[df["ex99_url"].notna() & (df["ex99_url"] != "")].reset_index(drop=True)
     before = len(df)
-    _SIGNAL_ITEMS = re.compile(r"\b(7\.01|8\.01|1\.01|2\.01|3\.02|5\.01)\b")
-    _has_202  = df["items"].fillna("").str.contains(r"\b2\.02\b", regex=True)
-    _has_signal = df["items"].fillna("").str.contains(_SIGNAL_ITEMS, regex=True)
+    _has_202    = df["items"].fillna("").str.contains(r"\b2\.02\b", regex=True)
+    _has_signal = df["items"].fillna("").str.contains(r"\b(?:7\.01|8\.01|1\.01|2\.01|3\.02|5\.01)\b", regex=True)
     df = df[~(_has_202 & ~_has_signal)].reset_index(drop=True)
     print(f"Loaded {len(df)} EX-99 exhibits ({before - len(df)} earnings-only filings excluded)", flush=True)
 

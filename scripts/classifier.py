@@ -147,7 +147,7 @@ def classify_catalyst(title):
 
     checks = [
         # ── SIGNAL tags ───────────────────────────────────────────────────────
-        (_CLINICAL,           "clinical"),
+        (_CLINICAL,           "biotech"),
         (_PRIVATE_PLACEMENT,  "private_placement"),
         (_COLLABORATION,      "collaboration"),
         (_MA,                 "m&a"),
@@ -214,6 +214,12 @@ def _bold_title(soup):
         if not _is_bold(p):
             continue
         text = " ".join(p.get_text(" ", strip=True).split())
+        if _ANNOUNCES_TAIL.search(text):
+            next_p = p.find_next_sibling("p")
+            if next_p:
+                next_text = " ".join(next_p.get_text(" ", strip=True).split())
+                if next_text:
+                    text = text + " " + next_text
         if len(text.split()) >= 4 and _is_valid_title(text):
             return text
     # Fallback: <font> inside <div> that is bold
@@ -304,6 +310,8 @@ def _is_valid_title(text: str) -> bool:
         return False
     return True
 
+
+_ANNOUNCES_TAIL = re.compile(r"\bAnnounces?\s*$", re.IGNORECASE)
 
 _PLAIN_TITLE_VERB = re.compile(
     r"\b(announces?|appoints?|completes?|launches?|introduces?|acquires?|divests?|"
