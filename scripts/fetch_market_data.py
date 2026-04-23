@@ -49,6 +49,14 @@ _TARGET_CATALYSTS = {
 }
 
 
+def _is_target(v) -> bool:
+    try:
+        tags = ast.literal_eval(v) if isinstance(v, str) else [v]
+        return bool(set(tags) & _TARGET_CATALYSTS)
+    except Exception:
+        return False
+
+
 
 # T+N offsets in milliseconds
 _OFFSETS_MS = {
@@ -127,7 +135,16 @@ def _bar_at_or_after(bars: list, ts_ms: int) -> dict | None:
     return None
 
 
-def compute_changes(bars: list, acceptance_dt: str | None) -> dict:
+def _bar_before(bars: list, ts_ms: int) -> dict | None:
+    prev = None
+    for bar in bars:
+        if bar["t"] >= ts_ms:
+            return prev
+        prev = bar
+    return prev
+
+
+def compute_changes(bars: list, acceptance_dt: str | None, daily: list | None = None) -> dict:
     result: dict = {
         "price_t0": None,
         **{f"change_{label}_pct": None for label in _OFFSETS_MS},
@@ -138,11 +155,14 @@ def compute_changes(bars: list, acceptance_dt: str | None) -> dict:
         dt = datetime.fromisoformat(acceptance_dt.replace("Z", "+00:00"))
     except ValueError:
         return result
-    t0_ms  = int(dt.timestamp() * 1000)
-    t0_bar = _bar_at_or_after(bars, t0_ms)
-    if t0_bar is None:
+    t0_ms   = int(dt.timestamp() * 1000)
+    pre_bar = _bar_before(bars, t0_ms)
+    if pre_bar is not None:
+        p0 = pre_bar["c"]
+    elif daily:
+        p0 = daily[-1]["c"]  # prior day close fallback for pre-market/after-hours
+    else:
         return result
-    p0 = t0_bar["c"]
     result["price_t0"] = p0
     for label, offset_ms in _OFFSETS_MS.items():
         bar = _bar_at_or_after(bars, t0_ms + offset_ms)
@@ -192,7 +212,7 @@ def _flatten_details(ticker: str, date_str: str, d: dict) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def run(biotech_only: bool = False):
+async def run(catalyst: str | None = None):
     if not MASSIVE_API_KEY:
         raise RuntimeError(
             "Missing API key. Set MASSIVE_API_KEY or POLYGON_API_KEY environment variable."
@@ -201,10 +221,8 @@ async def run(biotech_only: bool = False):
     pr_df = pd.read_csv(INPUT_CSV)
     pr_df = pr_df[pr_df["is_pr"] == True].reset_index(drop=True)
 
-    catalyst_filter = {"biotech"} if biotech_only else _TARGET_CATALYSTS
+    catalyst_filter = {catalyst} if catalyst else _TARGET_CATALYSTS
     pr_df = pr_df[pr_df["catalyst"].apply(lambda v: bool(set(ast.literal_eval(v) if isinstance(v, str) else [v]) & catalyst_filter))].reset_index(drop=True)
-    if biotech_only:
-        pr_df = pr_df[pr_df["catalyst_source"].isna()].reset_index(drop=True)
     print(f"Loaded {len(pr_df)} PR rows from {INPUT_CSV} (catalyst filter: {catalyst_filter})")
 
     # ── Step 1: SEC submissions — CIK → ticker (cached) ──────────────────────
@@ -248,7 +266,9 @@ async def run(biotech_only: bool = False):
     if os.path.exists(OUTPUT_DETAILS_CSV):
         _td = pd.read_csv(OUTPUT_DETAILS_CSV, usecols=["ticker", "date_str"])
         fetched_td = set(zip(_td["ticker"], _td["date_str"]))
-        print(f"  {len(fetched_td)} (ticker, date_str) pairs already fetched — skipping Polygon calls")
+        current_pairs = set(zip(pr_df["ticker"].dropna(), pr_df["date_str"]))
+        overlap = len(fetched_td & current_pairs)
+        print(f"  {overlap} (ticker, date_str) pairs already fetched — skipping Polygon calls")
 
     bars_cache: dict    = {}   # (ticker, date_str) → list[dict]
     daily_cache: dict   = {}   # (ticker, date_str) → list[dict]
@@ -362,7 +382,8 @@ async def run(biotech_only: bool = False):
                     # in a prior run (fetched_td hit — bars not in memory)
                     bars = bars_cache.get(cache_key, [])
 
-                changes = compute_changes(bars, row.get("acceptance_dt"))
+                daily = daily_cache.get(cache_key, [])
+                changes = compute_changes(bars, row.get("acceptance_dt"), daily=daily or None)
                 rows_out.append(_price_row(row, ticker, date_str, changes))
 
     except (KeyboardInterrupt, Exception) as exc:
@@ -377,9 +398,10 @@ async def run(biotech_only: bool = False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--biotech", action="store_true", help="Only fetch prices for biotech catalyst rows")
+    parser.add_argument("--catalyst", metavar="NAME",
+                        help="Only fetch prices for rows matching this catalyst tag (e.g. crypto_treasury)")
     args = parser.parse_args()
-    asyncio.run(run(biotech_only=args.biotech))
+    asyncio.run(run(catalyst=args.catalyst))
 
 
 if __name__ == "__main__":
