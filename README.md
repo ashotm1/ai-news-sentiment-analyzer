@@ -33,6 +33,6 @@ Quick headline sentiment demo — scrapes stock headlines and runs sentiment on 
 ## Requirements
 
 - `ANTHROPIC_API_KEY` — LLM classification + feature extraction
-- `MASSIVE_API_KEY` or `POLYGON_API_KEY` — Polygon.io price data
+- `MASSIVE_API_KEY` or `POLYGON_API_KEY` — Polygon.io price data (requires Starter+ / unlimited tier — the market data fetcher runs concurrent requests and assumes no rate limit)
 - `SEC_USER_AGENT` — SEC EDGAR fair-access policy (e.g. `"Name email@example.com"`)
 - `OPENAI_API_KEY` — only if using GPT model in UI

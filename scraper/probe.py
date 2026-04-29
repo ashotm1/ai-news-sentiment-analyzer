@@ -16,6 +16,7 @@ Usage:
     python scraper/probe.py --site globenewswire
     python scraper/probe.py --site globenewswire --duration 30
     python scraper/probe.py --duration 60 --delays 4 3 2 1.5 1 0.5
+    python scraper/probe.py --site stocktitan --method playwright --delays 2 1.5 1
 """
 
 import argparse
@@ -29,6 +30,12 @@ try:
     HAS_CURL_CFFI = True
 except ImportError:
     HAS_CURL_CFFI = False
+
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
 
 HEADERS = {
     "User-Agent": (
@@ -107,6 +114,43 @@ def fetch_curl(url: str):
     return resp.status_code, resp.text, dict(resp.headers)
 
 
+_pw_context = None  # reused across calls within a probe run
+
+def fetch_playwright(url: str):
+    global _pw_context
+    if _pw_context is None:
+        raise RuntimeError("Playwright context not initialised — call init_playwright() first")
+    page = _pw_context.new_page()
+    try:
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+        status = resp.status if resp else 0
+        text = page.content()
+        return status, text, {}
+    finally:
+        page.close()
+
+
+def init_playwright() -> "contextmanager":
+    """Start a stealth Playwright browser; returns the playwright instance to stop later."""
+    global _pw_context
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(headless=True)
+    _pw_context = browser.new_context(
+        user_agent=HEADERS["User-Agent"],
+        locale="en-US",
+        timezone_id="America/New_York",
+        viewport={"width": 1280, "height": 800},
+        extra_http_headers={
+            "Accept-Language": HEADERS["Accept-Language"],
+            "Accept-Encoding": HEADERS["Accept-Encoding"],
+            "DNT": HEADERS["DNT"],
+        },
+    )
+    # patch navigator.webdriver
+    _pw_context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return pw, browser
+
+
 def detect_method(site: str, url: str) -> tuple[str, bool]:
     """
     Returns (method, phase1_blocked).
@@ -135,7 +179,22 @@ def detect_method(site: str, url: str) -> tuple[str, bool]:
     else:
         print("  → curl_cffi not installed, skipping (pip install curl_cffi)")
 
-    print("  → needs Playwright (or site is fully down)")
+    if HAS_PLAYWRIGHT:
+        try:
+            pw, browser = init_playwright()
+            status, text, _ = fetch_playwright(url)
+            if not _is_blocked(status, text):
+                print(f"  → playwright works (status {status})")
+                return "playwright", False
+            print(f"  → playwright blocked (status {status})")
+            browser.close()
+            pw.stop()
+        except Exception as e:
+            print(f"  → playwright error: {e}")
+    else:
+        print("  → playwright not installed, skipping (pip install playwright && playwright install chromium)")
+
+    print("  → all methods failed")
     return "playwright", True
 
 
@@ -144,7 +203,12 @@ def probe_level(url: str, method: str, delay: float, duration: float) -> LevelRe
     Send requests at fixed delay for `duration` seconds.
     Stops immediately on first block.
     """
-    fetch = fetch_curl if method == "curl_cffi" else fetch_requests
+    if method == "curl_cffi":
+        fetch = fetch_curl
+    elif method == "playwright":
+        fetch = fetch_playwright
+    else:
+        fetch = fetch_requests
     start = time.monotonic()
     sent = 0
 
@@ -191,18 +255,31 @@ def probe_site(site: str, url: str, duration: float, delays: list[float], force_
     else:
         method, phase1_blocked = detect_method(site, url)
 
-    if phase1_blocked or method == "playwright":
+    if phase1_blocked:
         return ProbeResult(site=site, method=method, phase1_blocked=phase1_blocked)
+
+    # for playwright forced via --method, init browser now (detect_method already inits it on auto-detect)
+    pw_handle = None
+    if method == "playwright" and _pw_context is None:
+        if not HAS_PLAYWRIGHT:
+            print("  playwright not installed — pip install playwright && playwright install chromium")
+            return ProbeResult(site=site, method=method, phase1_blocked=True)
+        pw_handle = init_playwright()
 
     print(f"\n[{site}] phase 2 — rate probing ({duration}s per level, delays: {delays})")
 
     levels = []
-    for delay in delays:
-        print(f"\n  testing delay={delay}s ...")
-        level = probe_level(url, method, delay, duration)
-        levels.append(level)
-        if level.blocked:
-            break  # stop on first block, no point going faster
+    try:
+        for delay in delays:
+            print(f"\n  testing delay={delay}s ...")
+            level = probe_level(url, method, delay, duration)
+            levels.append(level)
+            if level.blocked:
+                break
+    finally:
+        if pw_handle:
+            pw_handle[1].close()
+            pw_handle[0].stop()
 
     return ProbeResult(site=site, method=method, phase1_blocked=False, phase2_levels=levels)
 
@@ -218,8 +295,8 @@ def print_site_summary(r: ProbeResult):
         print()
         return
 
-    if r.method == "playwright":
-        print(f"  phase 2:         skipped — Playwright required, use 2-3s delay as safe default")
+    if r.phase1_blocked and r.method == "playwright":
+        print(f"  phase 2:         skipped — all methods failed, Playwright may help manually")
         print()
         return
 
@@ -257,7 +334,7 @@ def main():
                         help="seconds to sustain each delay level (default: 60)")
     parser.add_argument("--delays", type=float, nargs="+", default=DEFAULT_DELAYS,
                         help="delay levels to test in seconds, e.g. --delays 4 3 2 1.5 1")
-    parser.add_argument("--method", choices=["requests", "curl_cffi"], default=None,
+    parser.add_argument("--method", choices=["requests", "curl_cffi", "playwright"], default=None,
                         help="force a specific fetch method, skipping phase 1 detection")
     args = parser.parse_args()
 

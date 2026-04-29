@@ -4,10 +4,10 @@ fetch_market_data.py — Fetch and store raw market data for detected press rele
 Pipeline (EDGAR source):
   1. Read data/ex_99_classified.csv (is_pr=True rows only)
   2. For each unique CIK: resolve ticker via SEC submissions API
-  3. For each unique (ticker, date): 3 sequential Polygon calls —
-       a. 1-min OHLCV bars  → data/price_bars.csv
-       b. Daily bars (40 calendar days prior) → data/daily_bars.csv
-       c. Ticker details (market cap, shares, exchange as of that date) → data/ticker_details.csv
+  3. For each unique (ticker, date): 3 concurrent Polygon calls —
+       a. Ticker details (market cap, shares, exchange as of that date) → data/ticker_details.csv
+       b. 1-min OHLCV bars  → data/price_bars.csv
+       c. Daily bars (40 calendar days prior) → data/daily_bars.csv
   4. PR metadata row → data/price_data.csv (dedup tracker)
 
 Pipeline (StockTitan source):
@@ -20,8 +20,8 @@ Requirements:
   Set MASSIVE_API_KEY env var (also accepted as POLYGON_API_KEY — same API, rebranded).
 
 Rate limits:
-  Massive free tier: 5 calls/min  →  MASSIVE_INTERVAL = 12.1s between calls
-  Paid tier: unlimited → set MASSIVE_INTERVAL = 0
+  Massive free tier: 5 calls/min — not supported by this script (concurrent fetcher)
+  Paid tier: unlimited — up to ~100 req/s, batched in groups of BATCH tickers
 
 Usage:
   python scripts/fetch_market_data.py                      # EDGAR source (default)
@@ -31,7 +31,6 @@ import argparse
 import ast
 import asyncio
 import os
-import time
 from datetime import datetime, timedelta
 
 import httpx
@@ -42,7 +41,7 @@ from edgar import fetch_ticker, load_cik_cache, save_cik_cache
 
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY") or os.environ.get("POLYGON_API_KEY")
 POLYGON_BASE = "https://api.polygon.io"
-MASSIVE_INTERVAL = 12.1      # seconds between Polygon calls (free tier: 5/min)
+MAX_CONCURRENT = 20  # tickers in-flight simultaneously (3 calls each → up to 60 open connections)
 
 EDGAR_INPUT_CSV    = "data/ex_99_classified.csv"
 EDGAR_OUTPUT_CSV   = "data/price_data.csv"
@@ -327,7 +326,7 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
     fetched: set = set()
     for path in (EDGAR_OUTPUT_CSV, ST_OUTPUT_CSV):
         if os.path.exists(path):
-            _existing = pd.read_csv(path, usecols=["ticker", "date_str"])
+            _existing = pd.read_csv(path, usecols=["ticker", "date_str"], on_bad_lines="skip")
             fetched |= set(zip(_existing["ticker"], _existing["date_str"]))
     fetched -= refetch_pairs  # allow re-fetch of incomplete rows
     print(f"  {len(fetched)} (ticker, date_str) pairs already processed — skipping")
@@ -335,14 +334,10 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
     to_fetch = len(input_pairs - fetched)
     print(f"  {to_fetch}/{len(input_pairs)} input pairs to fetch")
 
-    bars_cache: dict    = {}   # (ticker, date_str) → list[dict]
-    daily_cache: dict   = {}   # (ticker, date_str) → list[dict]
-    details_cache: dict = {}   # (ticker, date_str) → dict
-
-    rows_out        = []   # → price_data.csv
-    intraday_rows   = []   # → price_bars.csv
-    daily_rows      = []   # → daily_bars.csv
-    details_rows    = []   # → ticker_details.csv
+    rows_out        = []
+    intraday_rows   = []
+    daily_rows      = []
+    details_rows    = []
 
     total_written   = {OUTPUT_CSV: 0, OUTPUT_BARS_CSV: 0, OUTPUT_DAILY_CSV: 0, OUTPUT_DETAILS_CSV: 0}
     write_header    = {p: not os.path.exists(p) for p in total_written}
@@ -362,96 +357,85 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
                 total_written[path] += len(buf)
                 buf.clear()
 
-    async def _poly_get(coro, label: str):
+    async def _process_ticker(client, ticker, date_str, rows):
         nonlocal api_calls
-        api_calls += 1
-        t = time.monotonic()
-        result = await coro
-        elapsed = time.monotonic() - t
-        print(f"  [call {api_calls}] {label}  {elapsed:.2f}s", flush=True)
-        remaining = MASSIVE_INTERVAL - elapsed
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        return result
+        details, bars, daily = await asyncio.gather(
+            fetch_ticker_details(client, ticker, date_str),
+            fetch_1min_bars(client, ticker, date_str),
+            fetch_daily_bars(client, ticker, date_str),
+        )
+        api_calls += 3
+
+        def _log(status):
+            print(f"  {ticker}  {date_str}  {status}", flush=True)
+
+        if not details:
+            _log("skip — no details")
+            return [_price_row(row, ticker, date_str, {}, source) for row in rows], [], [], []
+
+        market_cap = details.get("market_cap")
+        if market_cap and market_cap > 500_000_000:
+            _log(f"skip — market cap ${market_cap/1e6:.0f}M")
+            return [_price_row(row, ticker, date_str, {}, source) for row in rows], [], [], []
+
+        if not bars:
+            _log("skip — no 1min bars")
+            return [_price_row(row, ticker, date_str, {}, source) for row in rows], [], [], []
+
+        intraday  = [{"ticker": ticker, "date_str": date_str, **bar} for bar in bars]
+        daily_out = [{"ticker": ticker, "date_str": date_str, **bar} for bar in daily]
+        det_out   = [_flatten_details(ticker, date_str, details)]
+        price_rows = [
+            _price_row(row, ticker, date_str,
+                       compute_changes(bars, row.get("acceptance_dt"), daily=daily or None),
+                       source)
+            for row in rows
+        ]
+        _log(f"ok — {len(bars)} 1min bars, {len(daily)} daily bars")
+        return price_rows, intraday, daily_out, det_out
 
     try:
+        # no-ticker rows — write immediately, no API calls needed
+        for _, row in pr_df.iterrows():
+            ticker   = row["ticker"]
+            date_str = row["date_str"]
+            if pd.isna(ticker) or not ticker:
+                rows_out.append(_price_row(row, ticker, date_str, {}, source))
+        _flush()
+
+        # group remaining rows by unique (ticker, date_str), skip already fetched
+        unique_pairs: dict = {}
+        for _, row in pr_df.iterrows():
+            ticker   = row["ticker"]
+            date_str = row["date_str"]
+            if pd.isna(ticker) or not ticker:
+                continue
+            if (ticker, date_str) in fetched:
+                continue
+            key = (ticker, date_str)
+            if key not in unique_pairs:
+                unique_pairs[key] = []
+            unique_pairs[key].append(row)
+
+        pairs_list = list(unique_pairs.items())
+        print(f"  {len(pairs_list)} unique (ticker, date_str) pairs to fetch\n")
+
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+        async def _fetch_and_flush(client, ticker, date_str, rows):
+            async with sem:
+                price_rows, intraday, daily_out, det_out = await _process_ticker(client, ticker, date_str, rows)
+            rows_out.extend(price_rows)
+            intraday_rows.extend(intraday)
+            daily_rows.extend(daily_out)
+            details_rows.extend(det_out)
+            _flush()
+
         async with httpx.AsyncClient(timeout=30) as poly_client:
-            for _, row in pr_df.iterrows():
-                ticker   = row["ticker"]
-                date_str = row["date_str"]
-
-                if (ticker, date_str) in fetched:
-                    continue
-
-                if pd.isna(ticker) or not ticker:
-                    rows_out.append(_price_row(row, ticker, date_str, {}, source))
-                    _flush()
-                    continue
-
-                cache_key = (ticker, date_str)
-
-                if cache_key not in bars_cache:
-                    print(f"\n  {ticker}  {date_str}", flush=True)
-
-                    # Call 1 — ticker details (most failable: delisted, unknown ticker, bad date)
-                    details = await _poly_get(
-                        fetch_ticker_details(poly_client, ticker, date_str),
-                        f"{ticker} details",
-                    )
-                    if not details:
-                        print(f"  No details — skipping bars for {ticker} {date_str}", flush=True)
-                        bars_cache[cache_key] = []
-                        rows_out.append(_price_row(row, ticker, date_str, {}, source))
-                        _flush()
-                        continue
-
-                    market_cap = details.get("market_cap")
-                    if market_cap and market_cap > 500_000_000:
-                        print(f"  Skipping {ticker} — market cap ${market_cap/1e6:.0f}M > $500M", flush=True)
-                        bars_cache[cache_key] = []
-                        rows_out.append(_price_row(row, ticker, date_str, {}, source))
-                        _flush()
-                        continue
-
-                    # Call 2 — 1-min intraday bars (fails on weekends, halted stocks)
-                    bars = await _poly_get(
-                        fetch_1min_bars(poly_client, ticker, date_str),
-                        f"{ticker} 1min",
-                    )
-                    if not bars:
-                        print(f"  No 1min bars — skipping daily for {ticker} {date_str}", flush=True)
-                        bars_cache[cache_key] = []
-                        rows_out.append(_price_row(row, ticker, date_str, {}, source))
-                        _flush()
-                        continue
-
-                    # Call 3 — daily bars (least failable)
-                    daily = await _poly_get(
-                        fetch_daily_bars(poly_client, ticker, date_str),
-                        f"{ticker} daily",
-                    )
-
-                    if not daily:
-                        print(f"  No daily bars for {ticker} {date_str}", flush=True)
-
-                    # Commit to buffers
-                    bars_cache[cache_key] = bars
-                    daily_cache[cache_key] = daily
-                    details_cache[cache_key] = details
-
-                    for bar in bars:
-                        intraday_rows.append({"ticker": ticker, "date_str": date_str, **bar})
-                    for bar in daily:
-                        daily_rows.append({"ticker": ticker, "date_str": date_str, **bar})
-                    details_rows.append(_flatten_details(ticker, date_str, details))
-
-                else:
-                    bars = bars_cache.get(cache_key, [])
-
-                daily = daily_cache.get(cache_key, [])
-                changes = compute_changes(bars, row.get("acceptance_dt"), daily=daily or None)
-                rows_out.append(_price_row(row, ticker, date_str, changes, source))
-                _flush()
+            await asyncio.gather(*[
+                _fetch_and_flush(poly_client, ticker, date_str, rows)
+                for (ticker, date_str), rows in pairs_list
+            ])
 
     except (KeyboardInterrupt, Exception) as exc:
         print(f"\nInterrupted ({exc.__class__.__name__}) — saving progress...", flush=True)
