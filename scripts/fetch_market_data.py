@@ -32,6 +32,9 @@ import ast
 import asyncio
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 
 import httpx
 import pandas as pd
@@ -50,6 +53,14 @@ ST_OUTPUT_CSV      = "data/st_price_data.csv"
 OUTPUT_BARS_CSV    = "data/price_bars.csv"        # shared — raw 1-min OHLCV bars
 OUTPUT_DAILY_CSV   = "data/daily_bars.csv"        # shared — raw daily OHLCV bars
 OUTPUT_DETAILS_CSV = "data/ticker_details.csv"    # shared — dedup key lives here
+
+
+def _rerun_path(p: str) -> str:
+    base, ext = p.rsplit(".", 1)
+    return f"{base}_rerun.{ext}"
+
+
+_FETCH_ERROR = object()  # sentinel: request failed (distinct from None/"results":null)
 
 # Signal-group catalysts to fetch prices for (see pr_detection.py classify_catalyst)
 _TARGET_CATALYSTS = {
@@ -93,10 +104,9 @@ async def fetch_1min_bars(client: httpx.AsyncClient, ticker: str, date_str: str)
         r = await client.get(url, timeout=30)
         if r.status_code == 200:
             return r.json().get("results", [])
-        print(f"  Polygon HTTP {r.status_code} for {ticker} 1min on {date_str}", flush=True)
-    except Exception as exc:
-        print(f"  Polygon error {ticker} 1min: {exc}", flush=True)
-    return []
+    except Exception:
+        return _FETCH_ERROR
+    return _FETCH_ERROR
 
 
 async def fetch_daily_bars(client: httpx.AsyncClient, ticker: str, date_str: str) -> list:
@@ -112,10 +122,9 @@ async def fetch_daily_bars(client: httpx.AsyncClient, ticker: str, date_str: str
         r = await client.get(url, timeout=30)
         if r.status_code == 200:
             return r.json().get("results", [])
-        print(f"  Polygon HTTP {r.status_code} for {ticker} daily", flush=True)
-    except Exception as exc:
-        print(f"  Polygon error {ticker} daily: {exc}", flush=True)
-    return []
+    except Exception:
+        return _FETCH_ERROR
+    return _FETCH_ERROR
 
 
 async def fetch_ticker_details(client: httpx.AsyncClient, ticker: str, date_str: str) -> dict:
@@ -129,10 +138,9 @@ async def fetch_ticker_details(client: httpx.AsyncClient, ticker: str, date_str:
         r = await client.get(url, timeout=30)
         if r.status_code == 200:
             return r.json().get("results", {})
-        print(f"  Polygon HTTP {r.status_code} for {ticker} details", flush=True)
-    except Exception as exc:
-        print(f"  Polygon error {ticker} details: {exc}", flush=True)
-    return {}
+    except Exception:
+        return _FETCH_ERROR
+    return _FETCH_ERROR
 
 
 # ── Price change computation ──────────────────────────────────────────────────
@@ -192,9 +200,9 @@ def _normalize_date(d) -> str:
 
 
 def _normalize_acceptance_dt(dt_str: str) -> str | None:
-    """Convert StockTitan '04/25/2026 01:00 PM' to ISO '2026-04-25 13:00:00'."""
+    """Convert StockTitan '04/25/2026 01:00 PM' (ET) to ISO with UTC offset."""
     try:
-        return datetime.strptime(dt_str.strip(), "%m/%d/%Y %I:%M %p").strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.strptime(dt_str.strip(), "%m/%d/%Y %I:%M %p").replace(tzinfo=_ET).isoformat()
     except Exception:
         return None
 
@@ -264,13 +272,24 @@ def _flatten_details(ticker: str, date_str: str, d: dict) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = False, refetch: bool = False):
+async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = False, refetch: bool = False, rewrite: bool = False):
     if not MASSIVE_API_KEY:
         raise RuntimeError(
             "Missing API key. Set MASSIVE_API_KEY or POLYGON_API_KEY environment variable."
         )
 
-    OUTPUT_CSV = ST_OUTPUT_CSV if source == "stocktitan" else EDGAR_OUTPUT_CSV
+    _out_csv     = ST_OUTPUT_CSV      if source == "stocktitan" else EDGAR_OUTPUT_CSV
+    _bars_csv    = OUTPUT_BARS_CSV
+    _daily_csv   = OUTPUT_DAILY_CSV
+    _details_csv = OUTPUT_DETAILS_CSV
+    if rewrite:
+        _out_csv     = _rerun_path(_out_csv)
+        _bars_csv    = _rerun_path(_bars_csv)
+        _daily_csv   = _rerun_path(_daily_csv)
+        _details_csv = _rerun_path(_details_csv)
+        for p in (_out_csv, _bars_csv, _daily_csv, _details_csv):
+            if os.path.exists(p):
+                os.remove(p)
 
     # ── Load input ────────────────────────────────────────────────────────────
     if source == "stocktitan":
@@ -310,8 +329,8 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
     # ── Refetch: find incomplete rows (price_t0 not null but some changes null) ─
     change_cols = [f"change_{l}_pct" for l in _OFFSETS_MS]
     refetch_pairs: set = set()
-    if refetch and os.path.exists(OUTPUT_CSV):
-        _out = pd.read_csv(OUTPUT_CSV)
+    if not rewrite and refetch and os.path.exists(_out_csv):
+        _out = pd.read_csv(_out_csv)
         _out_complete = _out["price_t0"].notna()
         _out_has_null = _out[change_cols].isnull().any(axis=1)
         _out_old_enough = _out["date_str"] <= cutoff
@@ -319,16 +338,17 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
         refetch_pairs = set(zip(_incomplete["ticker"], _incomplete["date_str"]))
         if refetch_pairs:
             _out_clean = _out[~(_out_complete & _out_has_null & _out_old_enough)]
-            _out_clean.to_csv(OUTPUT_CSV, index=False)
-            print(f"  {len(refetch_pairs)} incomplete rows removed from {OUTPUT_CSV} for re-fetch")
+            _out_clean.to_csv(_out_csv, index=False)
+            print(f"  {len(refetch_pairs)} incomplete rows removed from {_out_csv} for re-fetch")
 
     # ── Dedup: (ticker, date_str) from both output CSVs ──────────────────────
     fetched: set = set()
-    for path in (EDGAR_OUTPUT_CSV, ST_OUTPUT_CSV):
-        if os.path.exists(path):
-            _existing = pd.read_csv(path, usecols=["ticker", "date_str"], on_bad_lines="skip")
-            fetched |= set(zip(_existing["ticker"], _existing["date_str"]))
-    fetched -= refetch_pairs  # allow re-fetch of incomplete rows
+    if not rewrite:
+        for path in (EDGAR_OUTPUT_CSV, ST_OUTPUT_CSV):
+            if os.path.exists(path):
+                _existing = pd.read_csv(path, usecols=["ticker", "date_str"], on_bad_lines="skip")
+                fetched |= set(zip(_existing["ticker"], _existing["date_str"]))
+        fetched -= refetch_pairs  # allow re-fetch of incomplete rows
     print(f"  {len(fetched)} (ticker, date_str) pairs already processed — skipping")
     input_pairs = set(zip(pr_df["ticker"].fillna(""), pr_df["date_str"]))
     to_fetch = len(input_pairs - fetched)
@@ -339,16 +359,16 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
     daily_rows      = []
     details_rows    = []
 
-    total_written   = {OUTPUT_CSV: 0, OUTPUT_BARS_CSV: 0, OUTPUT_DAILY_CSV: 0, OUTPUT_DETAILS_CSV: 0}
+    total_written   = {_out_csv: 0, _bars_csv: 0, _daily_csv: 0, _details_csv: 0}
     write_header    = {p: not os.path.exists(p) for p in total_written}
     api_calls       = 0
 
     def _flush():
         pairs = [
-            (rows_out,      OUTPUT_CSV),
-            (intraday_rows, OUTPUT_BARS_CSV),
-            (daily_rows,    OUTPUT_DAILY_CSV),
-            (details_rows,  OUTPUT_DETAILS_CSV),
+            (rows_out,      _out_csv),
+            (intraday_rows, _bars_csv),
+            (daily_rows,    _daily_csv),
+            (details_rows,  _details_csv),
         ]
         for buf, path in pairs:
             if buf:
@@ -357,41 +377,64 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
                 total_written[path] += len(buf)
                 buf.clear()
 
+    def _with_status(d: dict, status: str) -> dict:
+        return {**d, "fetch_status": status}
+
     async def _process_ticker(client, ticker, date_str, rows):
         nonlocal api_calls
-        details, bars, daily = await asyncio.gather(
-            fetch_ticker_details(client, ticker, date_str),
-            fetch_1min_bars(client, ticker, date_str),
-            fetch_daily_bars(client, ticker, date_str),
-        )
-        api_calls += 3
-
         def _log(status):
             print(f"  {ticker}  {date_str}  {status}", flush=True)
 
+        def _skip_rows(status):
+            return [_with_status(_price_row(row, ticker, date_str, {}, source), status) for row in rows]
+
+        try:
+            details, bars, daily = await asyncio.gather(
+                fetch_ticker_details(client, ticker, date_str),
+                fetch_1min_bars(client, ticker, date_str),
+                fetch_daily_bars(client, ticker, date_str),
+            )
+        except Exception as exc:
+            _log(f"error — {exc}")
+            return _skip_rows(f"error_{type(exc).__name__}"), [], [], []
+        api_calls += 3
+
+        if details is _FETCH_ERROR:
+            _log("error — details call failed")
+            return _skip_rows("error_details"), [], [], []
         if not details:
             _log("skip — no details")
-            return [_price_row(row, ticker, date_str, {}, source) for row in rows], [], [], []
+            return _skip_rows("skip_no_details"), [], [], []
 
         market_cap = details.get("market_cap")
         if market_cap and market_cap > 500_000_000:
+            status = f"skip_market_cap_{market_cap/1e6:.0f}M"
             _log(f"skip — market cap ${market_cap/1e6:.0f}M")
-            return [_price_row(row, ticker, date_str, {}, source) for row in rows], [], [], []
+            return _skip_rows(status), [], [], []
 
+        if bars is _FETCH_ERROR:
+            _log("error — 1min bars call failed")
+            return _skip_rows("error_bars"), [], [], []
         if not bars:
             _log("skip — no 1min bars")
-            return [_price_row(row, ticker, date_str, {}, source) for row in rows], [], [], []
+            return _skip_rows("skip_no_bars"), [], [], []
 
-        intraday  = [{"ticker": ticker, "date_str": date_str, **bar} for bar in bars]
-        daily_out = [{"ticker": ticker, "date_str": date_str, **bar} for bar in daily]
+        daily_list = daily if isinstance(daily, list) else []
+        status = "ok" if daily_list else ("error_daily" if daily is _FETCH_ERROR else "ok_no_daily")
+        _BAR_FIELDS = ("v", "vw", "o", "c", "h", "l", "t", "n")
+        intraday  = [{"ticker": ticker, "date_str": date_str, **{k: bar.get(k) for k in _BAR_FIELDS}} for bar in bars]
+        daily_out = [{"ticker": ticker, "date_str": date_str, **{k: bar.get(k) for k in _BAR_FIELDS}} for bar in daily_list]
         det_out   = [_flatten_details(ticker, date_str, details)]
         price_rows = [
-            _price_row(row, ticker, date_str,
-                       compute_changes(bars, row.get("acceptance_dt"), daily=daily or None),
-                       source)
+            _with_status(
+                _price_row(row, ticker, date_str,
+                           compute_changes(bars, row.get("acceptance_dt"), daily=daily_list or None),
+                           source),
+                status,
+            )
             for row in rows
         ]
-        _log(f"ok — {len(bars)} 1min bars, {len(daily)} daily bars")
+        _log(f"{status} — {len(bars)} 1min bars, {len(daily_list)} daily bars")
         return price_rows, intraday, daily_out, det_out
 
     try:
@@ -400,7 +443,7 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
             ticker   = row["ticker"]
             date_str = row["date_str"]
             if pd.isna(ticker) or not ticker:
-                rows_out.append(_price_row(row, ticker, date_str, {}, source))
+                rows_out.append(_with_status(_price_row(row, ticker, date_str, {}, source), "skip_no_ticker"))
         _flush()
 
         # group remaining rows by unique (ticker, date_str), skip already fetched
@@ -449,16 +492,29 @@ async def run(source: str = "edgar", catalyst: str | None = None, sig: bool = Fa
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["edgar", "stocktitan"], default="edgar",
-                        help="input source (default: edgar)")
+    parser.add_argument("--source", choices=["edgar", "stocktitan", "all"], default="edgar",
+                        help="input source — 'all' runs edgar then stocktitan (default: edgar)")
     parser.add_argument("--catalyst", metavar="NAME",
                         help="EDGAR only: filter by catalyst tag (e.g. crypto_treasury)")
     parser.add_argument("--sig", action="store_true",
                         help="StockTitan only: filter to significant tags (acquisition, partnership, clinical trial, crypto, private placement, fda approval)")
     parser.add_argument("--refetch", action="store_true",
                         help="re-fetch rows with partial price data (price_t0 set but some changes null)")
+    parser.add_argument("--rewrite-all", action="store_true",
+                        help="re-process all rows for both sources, writing to *_rerun.csv files (ignores dedup)")
     args = parser.parse_args()
-    asyncio.run(run(source=args.source, catalyst=args.catalyst, sig=args.sig, refetch=args.refetch))
+
+    async def _main():
+        if args.rewrite_all:
+            await run(source="edgar",      catalyst=args.catalyst, sig=args.sig, rewrite=True)
+            await run(source="stocktitan", catalyst=args.catalyst, sig=args.sig, rewrite=True)
+        elif args.source == "all":
+            await run(source="edgar",      catalyst=args.catalyst, sig=args.sig, refetch=args.refetch)
+            await run(source="stocktitan", catalyst=args.catalyst, sig=args.sig, refetch=args.refetch)
+        else:
+            await run(source=args.source, catalyst=args.catalyst, sig=args.sig, refetch=args.refetch)
+
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":
