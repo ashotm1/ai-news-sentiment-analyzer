@@ -37,6 +37,7 @@ ANW_MONTHLY_DONE = f"{ANW_MONTHLY_DIR}/sitemap_done.txt"
 ANW_DIR          = f"{DATA}/anw"
 ANW_SIGNAL       = f"{ANW_DIR}/anw_signal_filtered.csv"
 ANW_ARTICLES     = f"{ANW_DIR}/anw_signal_articles.csv"
+ANW_CLASSIFIED   = f"{ANW_DIR}/anw_classified.csv"
 ANW_ARTICLES_DIR = f"{ANW_DIR}/articles"
 
 # ── PRNewswire ────────────────────────────────────────────────────────────────

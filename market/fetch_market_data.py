@@ -10,7 +10,7 @@ Three bar files, each with a different dedup strategy:
   ticker_details.csv — market cap / shares / exchange per (ticker, event_date)
                     dedup: skip (ticker, event_date) already present
 
-Sources: gnw_signal_filtered, prnw_signal_filtered, bw_signal_filtered
+Sources: gnw_signal_filtered, prnw_signal_filtered, bw_signal_filtered, anw_classified
 Market-cap gate: skip tickers with cap > 500M at event date.
 
 Requirements: MASSIVE_API_KEY or POLYGON_API_KEY env var.
@@ -31,7 +31,7 @@ import httpx
 import pandas as pd
 
 from config.paths import (
-    GNW_SIGNAL, PRNW_SIGNAL, BW_SIGNAL,
+    GNW_SIGNAL, PRNW_SIGNAL, BW_SIGNAL, ANW_CLASSIFIED,
     BARS_1MIN, BARS_10MIN, BARS_DAILY_NW, TICKER_DETAILS,
     ensure_dirs,
 )
@@ -164,7 +164,7 @@ def _has_catalyst(v, target: str) -> bool:
 
 
 def load_nw_events(sources: list[str], catalyst: str | None = None) -> pd.DataFrame:
-    """Load (ticker, event_date, event_dt) from requested NW sources, deduped by (ticker, event_date)."""
+    """Load (ticker, event_dt) from requested NW sources, deduped by (ticker, date)."""
     frames = []
 
     if "gnw" in sources and os.path.exists(GNW_SIGNAL):
@@ -172,32 +172,42 @@ def load_nw_events(sources: list[str], catalyst: str | None = None) -> pd.DataFr
         df = df[df["ticker"].notna() & (df["ticker"].astype(str).str.strip() != "")]
         if catalyst:
             df = df[df["catalyst"].apply(lambda v: _has_catalyst(v, catalyst))]
-        df["event_dt"]   = df["datetime"].apply(_parse_et)
-        df["event_date"] = df["event_dt"].str[:10]
-        frames.append(df[["ticker", "event_date", "event_dt"]].dropna(subset=["event_dt"]))
+        df["event_dt"] = df["datetime"].apply(_parse_et)
+        frames.append(df[["ticker", "event_dt"]].dropna(subset=["event_dt"]))
 
     if "prnw" in sources and os.path.exists(PRNW_SIGNAL):
         df = pd.read_csv(PRNW_SIGNAL, usecols=["datetime", "ticker", "catalyst"])
         df = df[df["ticker"].notna() & (df["ticker"].astype(str).str.strip() != "")]
         if catalyst:
             df = df[df["catalyst"].apply(lambda v: _has_catalyst(v, catalyst))]
-        df["event_dt"]   = df["datetime"].apply(_parse_iso)
-        df["event_date"] = df["event_dt"].str[:10]
-        frames.append(df[["ticker", "event_date", "event_dt"]].dropna(subset=["event_dt"]))
+        df["event_dt"] = df["datetime"].apply(_parse_iso)
+        frames.append(df[["ticker", "event_dt"]].dropna(subset=["event_dt"]))
 
     if "bw" in sources and os.path.exists(BW_SIGNAL):
         df = pd.read_csv(BW_SIGNAL, usecols=["datetime", "ticker"])
         df = df[df["ticker"].notna() & (df["ticker"].astype(str).str.strip() != "")]
-        df["event_dt"]   = df["datetime"].apply(_parse_et)
-        df["event_date"] = df["event_dt"].str[:10]
-        frames.append(df[["ticker", "event_date", "event_dt"]].dropna(subset=["event_dt"]))
+        df["event_dt"] = df["datetime"].apply(_parse_et)
+        frames.append(df[["ticker", "event_dt"]].dropna(subset=["event_dt"]))
+
+    if "anw" in sources and os.path.exists(ANW_CLASSIFIED):
+        df = pd.read_csv(ANW_CLASSIFIED, usecols=["datetime", "ticker", "catalyst"])
+        df = df[df["ticker"].notna() & (df["ticker"].astype(str).str.strip() != "")]
+        if catalyst:
+            df = df[df["catalyst"].apply(lambda v: _has_catalyst(v, catalyst))]
+        df["event_dt"] = df["datetime"].apply(_parse_iso)
+        frames.append(df[["ticker", "event_dt"]].dropna(subset=["event_dt"]))
 
     if not frames:
-        return pd.DataFrame(columns=["ticker", "event_date", "event_dt"])
+        return pd.DataFrame(columns=["ticker", "event_dt"])
 
     combined = pd.concat(frames, ignore_index=True)
-    # keep earliest event_dt per (ticker, event_date) when sources overlap
-    combined = combined.sort_values("event_dt").drop_duplicates(subset=["ticker", "event_date"])
+    # keep earliest event_dt per (ticker, date) when sources overlap
+    combined = (
+        combined.sort_values("event_dt")
+        .assign(_date=lambda d: d["event_dt"].str[:10])
+        .drop_duplicates(subset=["ticker", "_date"])
+        [["ticker", "event_dt"]]
+    )
     return combined.reset_index(drop=True)
 
 
@@ -267,6 +277,11 @@ def _flatten_details(ticker: str, event_date: str, d: dict) -> dict:
     }
 
 
+def _event_date(dt: str) -> str:
+    """ISO event_dt → 'YYYY-MM-DD' date string."""
+    return dt[:10]
+
+
 def _gap_from_date(last_date: str | None, five_yr: str) -> str:
     """Start date for a gap-fill fetch: one day before last known bar, or five years ago."""
     if not last_date:
@@ -312,7 +327,7 @@ async def run_nw(sources: list[str] | None = None, catalyst: str | None = None):
         raise RuntimeError("Set MASSIVE_API_KEY or POLYGON_API_KEY.")
     ensure_dirs()
 
-    sources = sources or ["gnw", "prnw", "bw"]
+    sources = sources or ["gnw", "prnw", "bw", "anw"]
     today   = datetime.today().strftime("%Y-%m-%d")
     five_yr = (datetime.today() - timedelta(days=_STARTER_LOOKBACK_YRS * 365)).strftime("%Y-%m-%d")
 
@@ -320,11 +335,11 @@ async def run_nw(sources: list[str] | None = None, catalyst: str | None = None):
     print(f"Loaded {len(events)} unique (ticker, event_date) pairs from {sources}")
 
     cutoff = (pd.Timestamp.today() - 2 * pd.tseries.offsets.BDay()).strftime("%Y-%m-%d")
-    events = events[events["event_date"] <= cutoff].reset_index(drop=True)
+    events = events[events["event_dt"].str[:10] <= cutoff].reset_index(drop=True)
     print(f"  {len(events)} after 2-trading-day cutoff ({cutoff})")
 
     if POLYGON_TIER == "starter":
-        events = events[events["event_date"] >= five_yr].reset_index(drop=True)
+        events = events[events["event_dt"].str[:10] >= five_yr].reset_index(drop=True)
         print(f"  {len(events)} after Starter tier 5yr lookback filter (>= {five_yr})")
 
     done_1min    = load_done_1min()
@@ -379,8 +394,8 @@ async def run_nw(sources: list[str] | None = None, catalyst: str | None = None):
     async def _process_ticker(client: httpx.AsyncClient, ticker: str, ticker_events: list):
         async with sem:
             try:
-                events_need_1min    = [e for e in ticker_events if (ticker, e["event_date"]) not in done_1min]
-                events_need_details = [e for e in ticker_events if (ticker, e["event_date"]) not in done_details]
+                events_need_1min    = [e for e in ticker_events if (ticker, _event_date(e["event_dt"])) not in done_1min]
+                events_need_details = [e for e in ticker_events if (ticker, _event_date(e["event_dt"])) not in done_details]
 
                 last_10 = last_10min.get(ticker)
                 last_dy = last_daily.get(ticker)
@@ -393,8 +408,8 @@ async def run_nw(sources: list[str] | None = None, catalyst: str | None = None):
                 # ── Ticker details + market-cap gate ──────────────────────────
                 mc = None
                 if events_need_details:
-                    first = min(events_need_details, key=lambda e: e["event_date"])
-                    det = await fetch_ticker_details(client, ticker, first["event_date"])
+                    first = min(events_need_details, key=lambda e: e["event_dt"])
+                    det = await fetch_ticker_details(client, ticker, _event_date(first["event_dt"]))
                     if det is _FETCH_ERROR:
                         c["det"][2] += 1
                         _log(f"  {ticker}  det=err")
@@ -409,7 +424,7 @@ async def run_nw(sources: list[str] | None = None, catalyst: str | None = None):
                         _log(f"  {ticker}  det=skip_mktcap_{mc/1e6:.0f}M")
                         return
                     c["det"][0] += 1
-                    _append(TICKER_DETAILS, [_flatten_details(ticker, e["event_date"], det) for e in events_need_details])
+                    _append(TICKER_DETAILS, [_flatten_details(ticker, _event_date(e["event_dt"]), det) for e in events_need_details])
                     _log(f"  {ticker}  det=ok  mktcap={mc/1e6:.0f}M" if mc else f"  {ticker}  det=ok  mktcap=unknown")
                 elif events_need_1min or need_10min or need_daily:
                     mc = known_mc.get(ticker)
@@ -418,15 +433,16 @@ async def run_nw(sources: list[str] | None = None, catalyst: str | None = None):
 
                 # ── 1-min: per-event tight window ─────────────────────────────
                 for ev in events_need_1min:
-                    bars = await fetch_1min_bars(client, ticker, ev["event_date"])
+                    ed = _event_date(ev["event_dt"])
+                    bars = await fetch_1min_bars(client, ticker, ed)
                     if not bars or bars is _FETCH_ERROR:
                         c["1min"][2 if bars is _FETCH_ERROR else 1] += 1
-                        _log(f"  {ticker}  {ev['event_date']}  1min=no_data")
+                        _log(f"  {ticker}  {ed}  1min=no_data")
                     else:
                         c["1min"][0] += 1
-                        _append(BARS_1MIN, [{"ticker": ticker, "event_date": ev["event_date"],
+                        _append(BARS_1MIN, [{"ticker": ticker, "event_date": ed,
                                              **{k: b.get(k) for k in _BAR_FIELDS}} for b in bars])
-                        _log(f"  {ticker}  {ev['event_date']}  1min=ok  bars={len(bars)}")
+                        _log(f"  {ticker}  {ed}  1min=ok  bars={len(bars)}")
 
                 # ── 10-min: gap-fill or full 5yr (streamed page-by-page) ───────
                 if need_10min:
@@ -507,8 +523,8 @@ def main():
     print(f"[log] {log_path}", flush=True)
 
     parser = argparse.ArgumentParser(description="Fetch NW-driven market data from Polygon.")
-    parser.add_argument("--sources", nargs="+", default=["gnw", "prnw", "bw"],
-                        choices=["gnw", "prnw", "bw"],
+    parser.add_argument("--sources", nargs="+", default=["gnw", "prnw", "bw", "anw"],
+                        choices=["gnw", "prnw", "bw", "anw"],
                         help="NW sources to include (default: all three)")
     parser.add_argument("--catalyst", metavar="NAME",
                         help="filter to a single catalyst tag (e.g. private_placement)")
